@@ -16,6 +16,9 @@ import ast, random, logging, time, contextlib, math, os.path, re, unicodedata
 
 # Klipper imports
 import chelper
+import queue
+import time
+import threading
 from extras.homing import Homing, HomingMove
 
 # Happy Hare imports
@@ -29,7 +32,7 @@ from .mmu_shared         import *
 from .mmu_logger         import MmuLogger
 from .mmu_selector       import VirtualSelector, LinearSelector
 from .mmu_test           import MmuTest
-from .mmu_utils          import DebugStepperMovement, PurgeVolCalculator
+from .mmu_utils          import DebugStepperMovement, PurgeVolCalculator, InteractivePrompt
 from .mmu_sensor_manager import MmuSensorManager
 
 
@@ -555,6 +558,7 @@ class Mmu:
         self.gcode.register_command('MMU_TEST_CONFIG', self.cmd_MMU_TEST_CONFIG, desc = self.cmd_MMU_TEST_CONFIG_help)
         self.gcode.register_command('MMU_TEST_RUNOUT', self.cmd_MMU_TEST_RUNOUT, desc = self.cmd_MMU_TEST_RUNOUT_help)
         self.gcode.register_command('MMU_TEST_FORM_TIP', self.cmd_MMU_TEST_FORM_TIP, desc = self.cmd_MMU_TEST_FORM_TIP_help)
+        self.gcode.register_command('MMU_SETUP', self.cmd_MMU_SETUP, desc=self.cmd_MMU_SETUP_help)
 
         # Soak Testing
         self.gcode.register_command('MMU_SOAKTEST_LOAD_SEQUENCE', self.cmd_MMU_SOAKTEST_LOAD_SEQUENCE, desc = self.cmd_MMU_SOAKTEST_LOAD_SEQUENCE_help)
@@ -614,6 +618,7 @@ class Mmu:
         self.reinit()
         self._reset_statistics()
         self.counters = {}
+        self.interactive_prompt = InteractivePrompt(self)
 
     # Initialize MMU hardare. Note that logging not set up yet so use main klippy logger
     def _setup_mmu_hardware(self, config):
@@ -2697,6 +2702,219 @@ class Mmu:
             self.handle_mmu_error(str(ee))
         finally:
             self.calibrating = False
+
+###############################
+# INTERACTIVE SETUP FUNCTIONS #
+###############################
+
+    cmd_MMU_SETUP_help = "Interactive MMU setup. Requires UI supporting macro prompts (such as Mainsail, KlipperScreen)"
+    def cmd_MMU_SETUP(self, gcmd):
+        if self.check_if_disabled(): return
+        threading.Thread(target=self._interactive_setup, args=(), kwargs={}).start()
+
+    def _interactive_setup(self, required_only=True):
+        # Ideas...
+        # Determine what calibrations are still required.
+        # Walk user through required calibrations, providing
+        # buttons to perform those calibrations. If a calibration
+        # fails in some way, present buttons to allow them to control
+        # moving the filament and attempt to recover and try again.
+        try:
+            # if requested required-only setup and no required calibrations,
+            # then just log and leave, we have nothing to do.
+            do_required_calibrations = self._interactive_required_calibration()
+            if required_only and not do_required_calibrations:
+                msg = "No required calibrations. Well done!" if do_required_calibrations is None else "Don't forget to complete the required calibrations."
+                self.reactor.register_callback(lambda et: self.log_always(msg))
+                return
+
+            for calibration in [self.CALIBRATED_SELECTOR, self.CALIBRATED_GEAR_RDS, self.CALIBRATED_ENCODER, self.CALIBRATED_BOWDENS]:
+                if self.check_if_not_calibrated(calibration, silent=False):
+                    if calibration == self.CALIBRATED_BOWDENS:
+                        self._interactive_bowden_calibration()
+            
+
+            # Non-required calibration...ask the user what they want to calibrate
+            response = self._prompt_setup_option()
+
+            if response == 'bowden':
+                method = self._interactive_bowden_calibration()
+
+
+        except Exception as e:
+            self.log_error("Error: %s" % e)
+
+    # Returns True if the user wants to start required calibration
+    # Returns False if the user does not want to start required calibration
+    # Returns None if there are no required calibrations to perform
+    def _interactive_required_calibration(self):
+        if not self.check_if_not_calibrated(self.CALIBRATED_ALL, silent=True):
+            return None
+
+        with self.interactive_prompt.wrap() as prompt:
+            return "start" == (
+                prompt.set_title('MMU Required Calibration')
+                .add_text('It looks like you have some MMU calibrations to complete.')
+                .add_footer_button('Maybe later')
+                .add_footer_button('Get Started!', value="start", color=prompt.COLOR_PRIMARY)
+                .show()
+                .response()
+            )
+
+    def _interactive_rotation_distance(self, gate=None):
+        if (self.mmu_machine.variable_rotation_distances == 1 and gate is None):
+            pass
+        
+        with self.interactive_prompt.wrap() as prompt:
+            (
+                prompt.set_title('Rotation Distance Calibration')
+                .add_text('')
+                .show()
+            )
+            return
+
+    def _interactive_bowden_calibration(self, gate=None):
+        if self.mmu_machine.variable_bowden_lengths == 1 and gate is None:
+            # iterate through the gates
+            pass
+
+        # if gate is not None, then select gate
+        gate_text = 'all gates' if gate is None else ('gate %s' % gate)
+        with self.interactive_prompt.wrap() as prompt:
+            response = (
+                prompt.set_title('Bowden length calibration')
+                .add_text('We will now calibrate the bowden length for %s. The goal of this calibration is to configure the bowden distance from the gate to the extruder gears.' % gate_text)
+                .add_footer_button('Start calibration', value='start', color=prompt.COLOR_PRIMARY)
+                .show()
+                .response()
+            )
+            if response != 'start':
+                return None
+
+        current_length = self.bowden_lengths[self.gate_selected]
+        initial_value = current_length if current_length >= 0 else 2000
+        approx_dist = self._prompt_for_number(
+            title='Approximate bowden length',
+            description='Please select the approximate bowden distance (TODO: recommend approximating higher or lower than actual depending on calibration type)',
+            # TODO: use current bowden length if available? or one of the other calibrated gates
+            # ...just saves the user from (inc/dec)rementing the approx value for each gate multiple times.
+            # Perhaps also round it up or down to nearest 10mm depending on if we need approx value higher or lower than actual
+            initial_value=initial_value
+        )
+
+        self.log_always('selected %d approx distance' % approx_dist)
+
+        do_calibration = True
+        while do_calibration:
+            with self.interactive_prompt.wrap() as prompt:
+                (
+                    prompt.set_title('Bowden calibration in progress')
+                    .add_text('Calibration for %s is in progress. Please wait.' % gate_text)
+                    .show()
+                )
+                # prompt.run_script_from_command('RESPOND MSG="Calibrating bowden with approx distance: %d"\nG4 P10000\nRESPOND MSG="Done with calibration"' % approx_dist)
+                prompt.run_script_from_command('MMU_CALIBRATE_BOWDEN SAVE=0 BOWDEN_LENGTH=%d' % approx_dist)
+
+                success = self.check_if_not_calibrated(self.CALIBRATED_BOWDENS, silent=False, check_gates=([gate] if gate is not None else None)),
+
+            if not success:
+                with self.interactive_prompt.wrap() as prompt:
+                    response = (
+                        prompt.set_title('Bowden calibration failed')
+                        .add_text('Looks like bowden calibration for %s failed.' % gate_text)
+                        .add_footer_button('Cancel', value='cancel', color=prompt.COLOR_SECONDARY)
+                        .add_footer_button('Home to gate and try again', value='home_try', color=prompt.COLOR_PRIMARY)
+                        .show()
+                        .response()
+                    )
+                    if response == 'cancel':
+                        do_calibration = False
+                        break
+                    elif response == 'home_try':
+                        self._interactive_homing(endstop_name = 'mmu_gate', dist=(approx_dist * self.DIRECTION_UNLOAD), homing_move=-1)
+                        # actual,homed,measured,_ = self.trace_filament_move('reverse home', approx_dist * self.DIRECTION_UNLOAD, endstop_name='mmu_gate', homing_move=-1, wait=True)
+                        # prompt.run_script_from_command('MMU_TEST_HOMING_MOVE MOVE=%d ENDSTOP=mmu_gate STOP_ON_ENDSOP=-1' % (approx_dist * self.DIRECTION_UNLOAD))
+
+    def _interactive_bowden_calibration_auto(self, gate=None):
+        pass
+
+    def _interactive_homing(self, endstop_name, dist, homing_move):
+        do_homing = True
+        homed = False
+        while do_homing:
+            actual,homed,measured,_ = self.trace_filament_move('interactive homing to %s' % endstop_name, dist=dist, endstop_name=endstop_name, homing_move=homing_move, wait=True)
+
+            if not homed:
+                with self.interactive_prompt.wrap() as prompt:
+                    response = (
+                        prompt.set_title('Homing failed')
+                        .add_text('We failed to home to %s after %d mm. What would you like to do?' % (endstop_name, actual))
+                        .add_text("Was the filament still moving? If so, let's try again.")
+                        .add_footer_button('Cancel', value='cancel', color=prompt.COLOR_SECONDARY)
+                        .add_footer_button('Try again', value='again', color=prompt.COLOR_PRIMARY)
+                        .show()
+                        .response()
+                    )
+                    if response == 'cancel' or id is None:
+                        do_homing = False
+        return homed
+
+
+    def _prompt_for_number(self, title, description, initial_value, steps=[10, 100], units='mm'):
+        current_value = initial_value
+        while True:
+            with self.interactive_prompt.wrap() as prompt:
+                prompt.set_title(title)
+                prompt.add_text(description)
+                prompt.add_footer_button('Use %d %s' % (current_value, units), value='continue', color=prompt.COLOR_PRIMARY)
+                for step in steps:
+                    down = abs(step) * -1
+                    up = abs(step)
+                    prompt.add_button_group(
+                        prompt.create_button('%d %s' % (down, units), color=prompt.COLOR_SECONDARY, value=down),
+                        prompt.create_button('%d %s' % (up, units), color=prompt.COLOR_PRIMARY, value=up),
+                    )
+                response = prompt.show().response()
+                if response == 'continue':
+                    return current_value
+                elif response is None:
+                    return None
+                else:
+                    current_value += response
+
+
+    def _prompt_setup_option(self):
+        # Menu
+        with self.interactive_prompt.wrap() as prompt:
+            btn_callback = lambda id, label: self.log_always("id %s => %s" % (id, label))
+            return (
+                prompt.set_title('MMU Setup')
+                .add_text('Welcome to the Happy Hare setup!')
+                .add_text('What would you like to setup?')
+                # .add_button('Click Me', id='one', callback=btn_callback)
+                # .add_button_group(
+                #     prompt.create_button('Click Me', id='two', color='info'),
+                #     prompt.create_button('Click Me', color='warning')
+                # )
+                .add_footer_button('Gear Calibration', value='gear', color=prompt.COLOR_PRIMARY)
+                .add_footer_button('Bowden Calibration', value='bowden', color=prompt.COLOR_PRIMARY)
+                .show()
+                .response()
+            )
+
+    def _prompt_bowden_calibration_method(self):
+        # TODO: Deterimine if setup can do auto calibration and give them a choice
+        #       Otherwise just do manual calibration.
+        with self.interactive_prompt.wrap() as prompt:
+            return (
+                prompt.set_title('Bowden calibration')
+                .add_text('There are a couple ways ')
+                .add_text('What would you like to setup?')
+                .add_footer_button('Auto calibration', id='auto')
+                .add_footer_button('Manual calibration', id='manual')
+                .show()
+                .response()
+            )
 
 
 #######################

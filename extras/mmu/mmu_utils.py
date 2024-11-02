@@ -16,7 +16,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
-import math
+import contextlib, math, time, threading, random, string
 
 
 # Internal testing class for debugging synced movement
@@ -144,3 +144,199 @@ class PurgeVolCalculator:
         g = (color_value >> 8) & 0xFF
         b = color_value & 0xFF
         return r, g, b
+
+# TODO: this may be large/complex enough to warrant moving to
+#       it's own file
+class InteractivePrompt:
+    TYPE_TEXT = 'text'
+    TYPE_BUTTON = 'button'
+    TYPE_FOOTER_BUTTON = 'footer_button'
+
+    COLOR_DEFAULT = None
+    COLOR_PRIMARY = 'primary'
+    COLOR_SECONDARY = 'secondary'
+    COLOR_INFO = 'info'
+    COLOR_WARNING = 'warning'
+    COLOR_ERROR = 'error'
+    COLORS = [COLOR_DEFAULT, COLOR_PRIMARY, COLOR_SECONDARY, COLOR_INFO, COLOR_WARNING, COLOR_ERROR]
+
+    def __init__(self, mmu):
+        self.mmu = mmu
+        self.gcode = mmu.gcode
+        self.reactor = mmu.reactor
+        self.mmu_machine = mmu.mmu_machine
+        self._is_open = False
+        self.reset()
+
+        # Counter to track the number of messages since the prompt began
+        # this is to work around a bug in mainsail where it only displays
+        # the dialog if the prompt messages are within the last 100 messages.
+        # When we have seen nearly 100 messages we will want to re-show
+        # the prompt to ensure it stays visible.
+        # TODO: implement re-show
+        self._msg_count_since_prompt = 0
+
+        self.gcode.register_command('__MMU_INTERACTIVE_RESPOND', self.cmd_MMU_INTERACTIVE_RESPOND, desc = self.cmd_MMU_INTERACTIVE_RESPOND_help)
+        
+        self.gcode.register_output_handler(self.gcode_msg_handler)
+
+    def gcode_msg_handler(self, msg):
+        if msg.startswith('// action:prompt_begin'):
+            self._msg_count_since_prompt = 0
+        else:
+            self._msg_count_since_prompt += 1
+            # Workaround for bug in Mainsail where dialog automatically
+            # closes if the prompt config is not in the last 100 messages
+            # if self._msg_count_since_prompt > 70 and self._is_open:
+            #     self.reactor.register_callback(lambda et: self.show())
+
+        if msg.startswith('// action:prompt_show'):
+            self._is_open = True
+
+        elif msg.startswith('// action:prompt_end'):
+            self.mmu.log_always("prompt was closed %s" % msg)
+            self._is_open = False
+
+    def run_on_main(self, cb, wait=True):
+        completion = self.reactor.register_callback(lambda et: cb())
+        if wait:
+            while not completion.test():
+                time.sleep(0.3)
+
+    def run_script_from_command(self, cmd, wait=True):
+        self.run_on_main(lambda et: self.gcode.run_script_from_command(cmd), wait=wait)
+        
+
+    @contextlib.contextmanager
+    def interactive_prompt(self, new_action):
+        old_action = self._set_action(new_action)
+        try:
+            yield (old_action, new_action)
+        finally:
+            self._set_action(old_action)
+
+    def next_response(self):
+        self._response = None
+        num = 0
+        while self._is_open:
+            # self.mmu.log_always("Waiting for response (id=%d) %d. is_open=%s. has response %s" % (0, num, self._is_open, self._response is not None))
+            if self._response is not None:
+                yield self._response
+                self._response = None
+            num += 1
+            time.sleep(.3)
+        yield (None, None)
+
+    def response(self):
+        for result in self.next_response():
+            return result
+
+    cmd_MMU_INTERACTIVE_RESPOND_help = "Interactive respond"
+    def cmd_MMU_INTERACTIVE_RESPOND(self, gcmd):
+        self.mmu.log_debug("Interactive response %s" % gcmd.get_commandline())
+        id = gcmd.get('CB')
+        if id in self._callbacks:
+            self._response = self._callbacks[id]()
+
+    def set_title(self, title):
+        self._prompt_title = title
+        return self
+
+    def add_text(self, text):
+        self._prompt_items.append((self.TYPE_TEXT, [text]))
+        return self
+
+    def add_button(self, label, value=None, callback=None, color=None, id=None):
+        return self._add_button(
+            self.TYPE_BUTTON,
+            label,
+            value=value,
+            callback=callback,
+            color=color,
+            id=id
+        )
+
+    def add_footer_button(self, label, value=None, callback=None, color=None, id=None):
+        return self._add_button(
+            self.TYPE_FOOTER_BUTTON,
+            label,
+            value=value,
+            callback=callback,
+            color=color,
+            id=id
+        )
+    
+    def add_button_group(self, *btns):
+        self._prompt_items.append(('button_group_start', None))
+        for kwargs in btns:
+            self.add_button(**kwargs)
+        self._prompt_items.append(('button_group_end', None))
+        return self
+
+    def create_button(self, label, value=None, callback=None, color=None, id=None):
+        return {
+            'label': label,
+            'value': value,
+            'callback': callback,
+            'color': color,
+            'id': id
+        }
+
+    def _add_button(self, type, label, value=None, callback=None, color=None, id=None):
+        cb_id = str(id if id is not None else len(self._callbacks))
+        value = label if value is None else value
+        self._callbacks[cb_id] = lambda: self._button_callback(cb_id, callback if callback is not None else (lambda id: value))
+        gcode = '__MMU_INTERACTIVE_RESPOND CB=\'%s\'' % cb_id
+        params = [label, gcode]
+        if color is not None:
+            params.append(color)
+        self._prompt_items.append((type, params))
+        return self
+    
+    def _button_callback(self, id, callback):
+        response = None if callback is None else callback(id)
+        return response
+
+    @contextlib.contextmanager
+    def wrap(self):
+        try:
+            self.reset()
+            yield self
+        finally:
+            self.close()
+
+    @contextlib.contextmanager
+    def wrap_show(self):
+        try:
+            self.show()
+            yield self
+        finally:
+            self.close()
+
+    def show(self):
+        cmd = self._build_prompt()
+        self.mmu.gcode.run_script_from_command(cmd)
+        return self
+
+    def close(self):
+        if self._is_open:
+            self.mmu.gcode.run_script_from_command('RESPOND TYPE=command MSG="action:prompt_end"')
+        return self
+
+    def reset(self):
+        self._prompt_title = None
+        self._prompt_items = []
+        self._callbacks = {}
+        self._response = None
+        return self
+
+    def _build_prompt(self):
+        cmds = [
+            'action:prompt_end',
+            'action:prompt_begin %s' % self._prompt_title,
+        ]
+        for type, params in self._prompt_items:
+            cmd = 'action:prompt_%s %s' % (type, '' if params is None else '|'.join(params))
+            cmds.append(cmd.strip())
+        cmds.append('action:prompt_show')
+        return '\n'.join(map(lambda cmd: 'RESPOND TYPE=command MSG="%s"' % cmd, cmds))
