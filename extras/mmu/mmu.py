@@ -2185,6 +2185,12 @@ class Mmu:
 
     def _calibrate_bowden_length_manual(self, approx_bowden_length, save=True):
         try:
+            if self.extruder_homing_endstop is not None and not self.sensor_manager.check_sensor(self.extruder_homing_endstop):
+                self.log_always("Filament is not at the extruder entry. Homing to extruder entry.")
+                self._set_filament_direction(self.DIRECTION_LOAD)
+                actual,homed,_,_ = self.trace_filament_move("Homing to extruder entry sensor", approx_bowden_length * self.DIRECTION_LOAD, motor="gear", homing_move=1, endstop_name=self.extruder_homing_endstop)
+                if not homed:
+                    raise MmuError("Calibration of bowden length failed. Did not home to gate sensor after moving %.1fmm" % approx_bowden_length)
             self.log_always("Calibrating bowden length for gate %d (manual method) using %s as gate reference point" % (self.gate_selected, self._gate_homing_string()))
             self._set_filament_direction(self.DIRECTION_UNLOAD)
             self.selector.filament_drive()
